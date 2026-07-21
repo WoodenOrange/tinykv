@@ -209,8 +209,8 @@ func newRaft(c *Config) *Raft {
 		r.Prs[r.id] = &Progress{Next: raftLog.LastIndex() + 1, Match: 0}
 	}
 
-	//随机化选举计时，避免多节点同时发起选举
-	r.electionElapsed = rand.Intn(r.electionTimeout)
+	//随机化选举计时
+	r.electionElapsed = -(1 + rand.Intn(r.electionTimeout-1))
 
 	return r
 }
@@ -219,7 +219,59 @@ func newRaft(c *Config) *Raft {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	pr, ok := r.Prs[to]
+	if !ok {
+		return false
+	}
+
+	lastIdx := r.RaftLog.LastIndex()
+	prevIdx := pr.Next - 1
+
+	//获取prevIdx的任期
+	prevTerm, err := r.RaftLog.Term(prevIdx)
+	if err != nil {
+		return false
+	}
+
+	//构建Append消息
+	m := pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Index:   prevIdx,
+		LogTerm: prevTerm,
+		Commit:  r.RaftLog.committed,
+	}
+
+	//若没有新条目，发送空的Append
+	if pr.Next > lastIdx {
+		m.Entries = nil
+		r.msgs = append(r.msgs, m)
+		return true
+	}
+
+	//获取从pr.Next到lastIdx的条目
+	entries := r.RaftLog.entries
+	if len(entries) == 0 {
+		return false
+	}
+	offset := entries[0].Index
+	lo := pr.Next
+	hi := lastIdx + 1
+	if lo < offset {
+		//需要快照
+		return false
+	}
+	startIdx := lo - offset
+	endIdx := hi - offset
+	if startIdx > uint64(len(entries)) || endIdx > uint64(len(entries)) {
+		return false
+	}
+	//转换为指针切片
+	m.Entries = entriesToPtr(entries[startIdx:endIdx])
+	r.msgs = append(r.msgs, m)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -256,7 +308,8 @@ func (r *Raft) tick() {
 	} else {
 		//Follower或Candidate，超时选举
 		if r.electionElapsed >= r.electionTimeout {
-			r.electionElapsed = 0
+			//重置随机超时
+			r.electionElapsed = -(1 + rand.Intn(r.electionTimeout-1))
 			_ = r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 		}
 	}
@@ -272,7 +325,8 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Lead = lead
 	r.Vote = None
 	r.votes = make(map[uint64]bool)
-	r.electionElapsed = 0
+	//随机选举超时[electionTimeout, 2*electionTimeout-1] ticks
+	r.electionElapsed = -(1 + rand.Intn(r.electionTimeout-1))
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -284,7 +338,8 @@ func (r *Raft) becomeCandidate() {
 	r.Lead = None
 	r.votes = make(map[uint64]bool)
 	r.votes[r.id] = true
-	r.electionElapsed = 0
+	//随机选举超时[electionTimeout, 2*electionTimeout-1] ticks
+	r.electionElapsed = -(1 + rand.Intn(r.electionTimeout-1))
 }
 
 // becomeLeader transform this peer's state to leader
@@ -320,6 +375,18 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	//本地消息不检查任期
+	if IsLocalMsg(m.MsgType) {
+		switch r.State {
+		case StateFollower:
+			return r.stepFollower(m)
+		case StateCandidate:
+			return r.stepCandidate(m)
+		case StateLeader:
+			return r.stepLeader(m)
+		}
+		return nil
+	}
 	//切换任期
 	if m.Term > r.Term {
 		r.becomeFollower(m.Term, None)
@@ -383,11 +450,17 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 func (r *Raft) stepLeader(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
-		//tick已发送，无需处理
+		//手动触发心跳，向所有其他节点发送心跳
+		for id := range r.Prs {
+			if id != r.id {
+				r.sendHeartbeat(id)
+			}
+		}
 	case pb.MessageType_MsgRequestVote:
 		resp := pb.Message{
 			MsgType: pb.MessageType_MsgRequestVoteResponse,
 			To:      m.From,
+			From:    r.id,
 			Term:    r.Term,
 			Reject:  true,
 		}
@@ -426,6 +499,32 @@ func (r *Raft) campaign() {
 		}
 		r.msgs = append(r.msgs, m)
 	}
+	r.checkVotes() // 立即检查自身票数
+}
+
+// +++
+// 检查是否当选
+func (r *Raft) checkVotes() {
+	if r.State != StateCandidate {
+		return
+	}
+	//统计票
+	granted := 0
+	rejected := 0
+	for _, v := range r.votes {
+		if v {
+			granted++
+		} else {
+			rejected++
+		}
+	}
+	quorum := len(r.Prs)/2 + 1
+	if granted >= quorum {
+		r.becomeLeader()
+	} else if rejected >= quorum {
+		//拒绝票过半，直接退回Follower
+		r.becomeFollower(r.Term, None)
+	}
 }
 
 // +++
@@ -436,6 +535,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		resp := pb.Message{
 			MsgType: pb.MessageType_MsgRequestVoteResponse,
 			To:      m.From,
+			From:    r.id,
 			Term:    r.Term,
 			Reject:  true,
 		}
@@ -450,6 +550,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		resp := pb.Message{
 			MsgType: pb.MessageType_MsgRequestVoteResponse,
 			To:      m.From,
+			From:    r.id,
 			Term:    r.Term,
 			Reject:  true,
 		}
@@ -462,6 +563,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	resp := pb.Message{
 		MsgType: pb.MessageType_MsgRequestVoteResponse,
 		To:      m.From,
+		From:    r.id,
 		Term:    r.Term,
 		Reject:  false,
 	}
@@ -475,23 +577,9 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 	if r.State != StateCandidate {
 		return
 	}
-	if m.Reject {
-		//2A不必处理被拒绝
-		return
-	}
-	//赞成，加票
-	r.votes[m.From] = true
-	granted := 0
-	for _, v := range r.votes {
-		if v {
-			granted++
-		}
-	}
-	//过半，当选
-	quorum := len(r.Prs)/2 + 1
-	if granted >= quorum {
-		r.becomeLeader()
-	}
+	// 记录赞成或反对，反对也要记录
+	r.votes[m.From] = !m.Reject
+	r.checkVotes() //验票
 }
 
 func (r *Raft) handleAppendResponse(m pb.Message) {
@@ -501,6 +589,66 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+	//若消息任期小于当前任期，拒绝
+	if m.Term < r.Term {
+		resp := pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  true,
+		}
+		r.msgs = append(r.msgs, resp)
+		return
+	}
+
+	//消息任期 >= 当前任期，转为 Follower 并更新任期和 Leader
+	r.becomeFollower(m.Term, m.From)
+	r.electionElapsed = 0 //重置选举超时计时器
+
+	//检查prevLogIndex和prevLogTerm
+	prevIdx := m.Index
+	prevTerm, err := r.RaftLog.Term(prevIdx)
+	if err != nil || prevTerm != m.LogTerm {
+		//日志不一致，拒绝
+		resp := pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  true,
+		}
+		r.msgs = append(r.msgs, resp)
+		return
+	}
+
+	//处理追加条目
+	if len(m.Entries) > 0 {
+		entries := ptrsToEntries(m.Entries)
+		//追加到日志，处理冲突和截断
+		r.RaftLog.entries = appendEntriesToLog(r.RaftLog.entries, entries)
+		r.RaftLog.stabled = r.RaftLog.LastIndex()
+	}
+
+	//更新commit索引
+	if m.Commit > r.RaftLog.committed {
+		lastIdx := r.RaftLog.LastIndex()
+		if m.Commit < lastIdx {
+			r.RaftLog.committed = m.Commit
+		} else {
+			r.RaftLog.committed = lastIdx
+		}
+	}
+
+	//回复成功
+	resp := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  false,
+	}
+	r.msgs = append(r.msgs, resp)
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -511,18 +659,18 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		resp := pb.Message{
 			MsgType: pb.MessageType_MsgHeartbeatResponse,
 			To:      m.From,
+			From:    r.id,
 			Term:    r.Term,
 			Reject:  true,
 		}
 		r.msgs = append(r.msgs, resp)
 		return
 	}
-	//重置选举超时计时器
-	r.electionElapsed = 0
-	//更新leaderID
-	if r.Lead != m.From {
-		r.Lead = m.From
-	}
+
+	//消息任期>=当前任期，转为Follower并更新任期和Leader
+	r.becomeFollower(m.Term, m.From)
+	r.electionElapsed = 0 //重置选举超时计时器
+
 	//更新已提交日志ID
 	if m.Commit > r.RaftLog.committed {
 		r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
@@ -531,6 +679,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	resp := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
 		To:      m.From,
+		From:    r.id,
 		Term:    r.Term,
 		Reject:  false,
 	}
@@ -550,4 +699,60 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+// +++
+// 将值切片转换为指针切片
+func entriesToPtr(entries []pb.Entry) []*pb.Entry {
+	ptrs := make([]*pb.Entry, len(entries))
+	for i := range entries {
+		ptrs[i] = &entries[i]
+	}
+	return ptrs
+}
+
+// +++
+// 将指针切片转换为值切片
+func ptrsToEntries(ptrs []*pb.Entry) []pb.Entry {
+	vals := make([]pb.Entry, len(ptrs))
+	for i, e := range ptrs {
+		vals[i] = *e
+	}
+	return vals
+}
+
+// +++
+// appendEntriesToLog 将新条目追加到现有日志中，处理冲突，任期不同则截断
+func appendEntriesToLog(existing []pb.Entry, newEntries []pb.Entry) []pb.Entry {
+	if len(newEntries) == 0 {
+		return existing
+	}
+	if len(existing) == 0 {
+		return newEntries
+	}
+
+	offset := existing[0].Index
+	lastIdx := existing[len(existing)-1].Index
+
+	for i, e := range newEntries {
+		idx := e.Index
+		if idx <= lastIdx {
+			localIdx := int(idx - offset)
+			if localIdx >= len(existing) {
+				// 索引超出范围，直接追加后续所有条目
+				return append(existing, newEntries[i:]...)
+			}
+			if existing[localIdx].Term != e.Term {
+				// 冲突：从该索引处截断，然后追加剩余新条目
+				existing = existing[:localIdx]
+				return append(existing, newEntries[i:]...)
+			}
+			// 任期相同，继续检查下一个
+		} else {
+			// idx > lastIdx，直接追加剩余条目
+			return append(existing, newEntries[i:]...)
+		}
+	}
+	// 所有新条目均已存在且任期相同，无需更改
+	return existing
 }
