@@ -322,20 +322,15 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	//切换任期
 	if m.Term > r.Term {
-		// Update term and become follower
 		r.becomeFollower(m.Term, None)
 	}
-	// If message term is less than current, ignore
+	//2AA忽略
 	if m.Term < r.Term {
-		// For response messages, we might still need to handle? But generally ignore.
 		if IsResponseMsg(m.MsgType) {
-			// We can ignore old responses
 			return nil
 		}
-		// For other messages, maybe reply with higher term? Not needed for 2A.
 		return nil
 	}
-
 	switch r.State {
 	case StateFollower:
 		return r.stepFollower(m)
