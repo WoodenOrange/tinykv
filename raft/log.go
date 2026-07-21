@@ -14,13 +14,17 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"errors"
+
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
-//  snapshot/first.....applied....committed....stabled.....last
-//  --------|------------------------------------------------|
-//                            log entries
+//	snapshot/first.....applied....committed....stabled.....last
+//	--------|------------------------------------------------|
+//	                          log entries
 //
 // for simplify the RaftLog implement should manage all log entries
 // that not truncated
@@ -56,7 +60,31 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	//获取未删除首位日志索引
+	first, err := storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+	last, err := storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	//读区间
+	entries, err := storage.Entries(first, last+1)
+	if err != nil && err != ErrCompacted && err != ErrUnavailable {
+		panic(err)
+	}
+	//没有，回空
+	if entries == nil {
+		entries = make([]pb.Entry, 0)
+	}
+	//设置稳定位置，返回
+	stabled := last
+	return &RaftLog{
+		storage: storage,
+		entries: entries,
+		stabled: stabled,
+	}
 }
 
 // We need to compact the log entries in some point of time like
@@ -70,30 +98,65 @@ func (l *RaftLog) maybeCompact() {
 // note, exclude any dummy entries from the return value.
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+	return l.entries
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	if len(l.entries) == 0 {
+		return nil
+	}
+	// 返回索引大于stabled的
+	var result []pb.Entry
+	for _, e := range l.entries {
+		if e.Index > l.stabled {
+			result = append(result, e)
+		}
+	}
+	return result
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	// 未应用index > applied，提交<= committed
+	var result []pb.Entry
+	for _, e := range l.entries {
+		if e.Index > l.applied && e.Index <= l.committed {
+			result = append(result, e)
+		}
+	}
+	return result
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+	if len(l.entries) == 0 {
+		//空就返回持久层最大值
+		idx, err := l.storage.LastIndex()
+		if err == nil {
+			return idx
+		}
+		return 0
+	}
+	return l.entries[len(l.entries)-1].Index
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	for _, e := range l.entries {
+		if e.Index == i {
+			return e.Term, nil
+		}
+	}
+	//内存没有，去持久层找
+	term, err := l.storage.Term(i)
+	if err == nil {
+		return term, nil
+	}
+	//没找到
+	return 0, errors.New("term not found")
 }
