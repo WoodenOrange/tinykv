@@ -106,6 +106,8 @@ func (c *Config) validate() error {
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
 	Match, Next uint64
+	//+++
+	LastSent uint64 // 最后一次发送的日志索引，用于成功响应时更新 Match
 }
 
 type Raft struct {
@@ -196,17 +198,17 @@ func newRaft(c *Config) *Raft {
 	if len(c.peers) > 0 {
 		//有peers，新建集群
 		for _, peer := range c.peers {
-			r.Prs[peer] = &Progress{Next: raftLog.LastIndex() + 1, Match: 0}
+			r.Prs[peer] = &Progress{Next: raftLog.LastIndex() + 1, Match: 0, LastSent: 0}
 		}
 	} else {
 		//没有，是重启节点
 		for _, node := range confState.Nodes {
-			r.Prs[node] = &Progress{Next: raftLog.LastIndex() + 1, Match: 0}
+			r.Prs[node] = &Progress{Next: raftLog.LastIndex() + 1, Match: 0, LastSent: 0}
 		}
 	}
 	//确保自身节点存在于进度映射，不存在则补充创建
 	if _, ok := r.Prs[r.id]; !ok {
-		r.Prs[r.id] = &Progress{Next: raftLog.LastIndex() + 1, Match: 0}
+		r.Prs[r.id] = &Progress{Next: raftLog.LastIndex() + 1, Match: 0, LastSent: 0}
 	}
 
 	//随机化选举计时
@@ -271,6 +273,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 	//转换为指针切片
 	m.Entries = entriesToPtr(entries[startIdx:endIdx])
 	r.msgs = append(r.msgs, m)
+
+	//记录发送的最后索引
+	pr.LastSent = lastIdx
 	return true
 }
 
@@ -352,7 +357,7 @@ func (r *Raft) becomeLeader() {
 	//重置节点日志同步进度
 	lastIdx := r.RaftLog.LastIndex()
 	for id := range r.Prs {
-		r.Prs[id] = &Progress{Next: lastIdx + 1, Match: 0}
+		r.Prs[id] = &Progress{Next: lastIdx + 1, Match: 0, LastSent: 0}
 	}
 	//noop日志
 	noop := pb.Entry{
@@ -391,11 +396,8 @@ func (r *Raft) Step(m pb.Message) error {
 	if m.Term > r.Term {
 		r.becomeFollower(m.Term, None)
 	}
-	//2AA忽略
+	//忽略任期更小的消息
 	if m.Term < r.Term {
-		if IsResponseMsg(m.MsgType) {
-			return nil
-		}
 		return nil
 	}
 	switch r.State {
@@ -470,8 +472,9 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	case pb.MessageType_MsgHeartbeatResponse:
 		//2A不处理
 	case pb.MessageType_MsgAppendResponse:
-		//2B内容
 		r.handleAppendResponse(m)
+	case pb.MessageType_MsgPropose:
+		r.handlePropose(m)
 	}
 	return nil
 }
@@ -582,8 +585,81 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 	r.checkVotes() //验票
 }
 
+// +++
 func (r *Raft) handleAppendResponse(m pb.Message) {
-	//(2B).
+	// 仅当状态为 Leader 且收到的是对等节点的响应
+	if r.State != StateLeader {
+		return
+	}
+	pr, ok := r.Prs[m.From]
+	if !ok {
+		return
+	}
+
+	if m.Reject {
+		// 日志不一致，回退 Next（简单递减）
+		if pr.Next > 1 {
+			pr.Next--
+		} else {
+			pr.Next = 1
+		}
+		// 尝试重新发送
+		r.sendAppend(m.From)
+		return
+	}
+
+	// 成功响应
+	// 更新 Match 为之前发送的最后索引
+	if pr.LastSent > pr.Match {
+		pr.Match = pr.LastSent
+	}
+	pr.Next = pr.Match + 1
+
+	// 尝试更新 commit 索引
+	r.maybeUpdateCommit()
+}
+
+// +++
+// maybeUpdateCommit尝试推进commit索引(仅leader)
+func (r *Raft) maybeUpdateCommit() {
+	if r.State != StateLeader {
+		return
+	}
+	oldCommit := r.RaftLog.committed // 更新前的commit，用于比较是否有新的commit
+	lastIdx := r.RaftLog.LastIndex()
+	//从当前committed+1开始，向上寻找能获得多数同意的最大索引
+	for idx := r.RaftLog.committed + 1; idx <= lastIdx; idx++ {
+		//检查该索引的任期是否等于当前任期（Raft 规则）
+		term, err := r.RaftLog.Term(idx)
+		if err != nil || term != r.Term {
+			continue
+		}
+		//统计Match>=idx的节点数（包括自己）
+		count := 1
+		for id, pr := range r.Prs {
+			if id == r.id {
+				continue
+			}
+			if pr.Match >= idx {
+				count++
+			}
+		}
+		if count*2 > len(r.Prs) {
+			//多数同意，推进commit
+			r.RaftLog.committed = idx
+		} else {
+			//更大的必不满足
+			break
+		}
+	}
+	//如果有新commit，立刻广播同步
+	if r.RaftLog.committed > oldCommit {
+		for id := range r.Prs {
+			if id != r.id {
+				r.sendAppend(id)
+			}
+		}
+	}
 }
 
 // handleAppendEntries handle AppendEntries RPC request
@@ -627,7 +703,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		entries := ptrsToEntries(m.Entries)
 		//追加到日志，处理冲突和截断
 		r.RaftLog.entries = appendEntriesToLog(r.RaftLog.entries, entries)
-		r.RaftLog.stabled = r.RaftLog.LastIndex()
 	}
 
 	//更新commit索引
@@ -686,6 +761,33 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	r.msgs = append(r.msgs, resp)
 }
 
+// +++
+// 处理客户端提案MsgPropose（仅Leader）
+func (r *Raft) handlePropose(m pb.Message) {
+	if len(m.Entries) == 0 {
+		return
+	}
+	//为每个条目设置的Index和Term
+	lastIdx := r.RaftLog.LastIndex()
+	for i, ent := range m.Entries {
+		ent.Index = lastIdx + uint64(i) + 1
+		ent.Term = r.Term
+		if ent.EntryType != pb.EntryType_EntryConfChange {
+			ent.EntryType = pb.EntryType_EntryNormal
+		}
+	}
+	//指针切片转值切片写入内存日志
+	newEntries := ptrsToEntries(m.Entries)
+	r.RaftLog.entries = append(r.RaftLog.entries, newEntries...)
+
+	//给所有Follower同步日志
+	for id := range r.Prs {
+		if id != r.id {
+			r.sendAppend(id)
+		}
+	}
+}
+
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
@@ -739,20 +841,20 @@ func appendEntriesToLog(existing []pb.Entry, newEntries []pb.Entry) []pb.Entry {
 		if idx <= lastIdx {
 			localIdx := int(idx - offset)
 			if localIdx >= len(existing) {
-				// 索引超出范围，直接追加后续所有条目
+				//索引超出范围，追加后续所有条目
 				return append(existing, newEntries[i:]...)
 			}
 			if existing[localIdx].Term != e.Term {
-				// 冲突：从该索引处截断，然后追加剩余新条目
+				//冲突：从该索引处截断，然后追加剩余新条目
 				existing = existing[:localIdx]
 				return append(existing, newEntries[i:]...)
 			}
-			// 任期相同，继续检查下一个
+			//任期相同，继续检查下一个
 		} else {
-			// idx > lastIdx，直接追加剩余条目
+			//idx > lastIdx，直接追加剩余条目
 			return append(existing, newEntries[i:]...)
 		}
 	}
-	// 所有新条目均已存在且任期相同，无需更改
+	//所有新条目均已存在且任期相同，无需更改
 	return existing
 }
