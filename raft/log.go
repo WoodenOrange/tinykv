@@ -105,14 +105,17 @@ func (l *RaftLog) allEntries() []pb.Entry {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	if len(l.entries) == 0 {
-		return nil
+		return []pb.Entry{} //返回空切片
 	}
-	// 返回索引大于stabled的
+	//返回索引大于stabled的
 	var result []pb.Entry
 	for _, e := range l.entries {
 		if e.Index > l.stabled {
 			result = append(result, e)
 		}
+	}
+	if len(result) == 0 {
+		return []pb.Entry{} //返回空切片
 	}
 	return result
 }
