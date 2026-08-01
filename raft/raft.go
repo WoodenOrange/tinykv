@@ -472,9 +472,9 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		}
 		r.msgs = append(r.msgs, resp)
 	case pb.MessageType_MsgHeartbeat:
-		//
+		//不理会
 	case pb.MessageType_MsgHeartbeatResponse:
-		//2A不处理
+		r.handleHeartbeatResponse(m)
 	case pb.MessageType_MsgAppendResponse:
 		r.handleAppendResponse(m)
 	case pb.MessageType_MsgPropose:
@@ -506,7 +506,7 @@ func (r *Raft) campaign() {
 		}
 		r.msgs = append(r.msgs, m)
 	}
-	r.checkVotes() // 立即检查自身票数
+	r.checkVotes() //立即检查自身票数
 }
 
 // +++
@@ -584,7 +584,7 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 	if r.State != StateCandidate {
 		return
 	}
-	// 记录赞成或反对，反对也要记录
+	//记录赞成或反对，反对也要记录
 	r.votes[m.From] = !m.Reject
 	r.checkVotes() //验票
 }
@@ -618,7 +618,7 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	}
 	pr.Next = pr.Match + 1
 
-	// 尝试更新 commit 索引
+	//尝试更新commit索引
 	r.maybeUpdateCommit()
 }
 
@@ -668,20 +668,7 @@ func (r *Raft) maybeUpdateCommit() {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	//若消息任期小于当前任期，拒绝
-	if m.Term < r.Term {
-		resp := pb.Message{
-			MsgType: pb.MessageType_MsgAppendResponse,
-			To:      m.From,
-			From:    r.id,
-			Term:    r.Term,
-			Reject:  true,
-		}
-		r.msgs = append(r.msgs, resp)
-		return
-	}
-
-	//消息任期 >= 当前任期，转为 Follower 并更新任期和 Leader
+	//消转为 Follower
 	r.becomeFollower(m.Term, m.From)
 
 	//检查prevLogIndex和prevLogTerm
@@ -718,13 +705,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 
 	//更新commit索引
-	if m.Commit > r.RaftLog.committed {
-		lastIdx := m.Index //若没有新条目，则上限为prevLogIndex
-		if len(m.Entries) > 0 {
-			lastIdx = m.Entries[len(m.Entries)-1].Index
-		}
-		r.RaftLog.committed = min(m.Commit, lastIdx)
+	lastIdx := m.Index //若没有新条目，则上限为prevLogIndex
+	if len(m.Entries) > 0 {
+		lastIdx = m.Entries[len(m.Entries)-1].Index
 	}
+	r.RaftLog.committed = min(m.Commit, lastIdx)
 
 	//回复成功
 	resp := pb.Message{
@@ -741,26 +726,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
-	//心跳消息任期更小，拒绝
-	if m.Term < r.Term {
-		resp := pb.Message{
-			MsgType: pb.MessageType_MsgHeartbeatResponse,
-			To:      m.From,
-			From:    r.id,
-			Term:    r.Term,
-			Reject:  true,
-		}
-		r.msgs = append(r.msgs, resp)
-		return
-	}
-
-	//更新commit，本地有未commit则不更新，避免将未commit错误提交
-	if r.RaftLog.committed == r.RaftLog.LastIndex() {
-		if m.Commit > r.RaftLog.committed {
-			r.RaftLog.committed = m.Commit
-		}
-	}
-
+	r.becomeFollower(m.Term, m.From)
 	//回复
 	resp := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
@@ -768,8 +734,32 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		From:    r.id,
 		Term:    r.Term,
 		Reject:  false,
+		Index:   r.RaftLog.LastIndex(),
 	}
 	r.msgs = append(r.msgs, resp)
+}
+
+// +++
+// 处理心跳回应，若有未同步日志，尝试同步
+func (r *Raft) handleHeartbeatResponse(m pb.Message) {
+	if r.State != StateLeader {
+		return
+	}
+	pr, ok := r.Prs[m.From]
+	if !ok {
+		return
+	}
+	//更新follower的匹配索引
+	if m.Index > pr.Match {
+		pr.Match = m.Index
+		pr.Next = pr.Match + 1
+	}
+	//如果follower日志落后，立即发送追加
+	if pr.Next <= r.RaftLog.LastIndex() {
+		r.sendAppend(m.From)
+	}
+	//尝试推进commit索引
+	r.maybeUpdateCommit()
 }
 
 // +++
