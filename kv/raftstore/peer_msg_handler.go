@@ -231,6 +231,11 @@ func (d *peerMsgHandler) applyNormalRequest(reqCmd *raft_cmdpb.Request, resp *ra
 		})
 
 	case raft_cmdpb.CmdType_Snap:
+		//只读事务，用于后续Scan
+		txn := d.ctx.engine.Kv.NewTransaction(false)
+		if proposal != nil {
+			proposal.cb.Txn = txn
+		}
 		resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
 			CmdType: raft_cmdpb.CmdType_Snap,
 			Snap: &raft_cmdpb.SnapResponse{
