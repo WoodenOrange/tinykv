@@ -308,6 +308,26 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+	firstIdx := entries[0].Index
+	lastIdx := entries[len(entries)-1].Index
+	lastTerm := entries[len(entries)-1].Term
+
+	// 删除从 firstIdx 到当前 lastIndex 的所有旧日志（将被覆盖）
+	for idx := firstIdx; idx <= ps.raftState.LastIndex; idx++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, idx))
+	}
+
+	// 写入新日志条目
+	for _, entry := range entries {
+		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+	}
+
+	// 更新内存中的 Raft 状态
+	ps.raftState.LastIndex = lastIdx
+	ps.raftState.LastTerm = lastTerm
 	return nil
 }
 
@@ -331,7 +351,43 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
-	return nil, nil
+	raftWB := new(engine_util.WriteBatch)
+	kvWB := new(engine_util.WriteBatch)
+
+	//保存HardState
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+
+	//追加日志条目
+	if err := ps.Append(ready.Entries, raftWB); err != nil {
+		return nil, err
+	}
+
+	//处理快照（Part C）
+	var snapResult *ApplySnapResult
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		res, err := ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			return nil, err
+		}
+		snapResult = res
+	}
+
+	//持久化RaftLocalState
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+
+	//写入raftdb
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return nil, err
+	}
+	//如果有kv变更，写入 kvdb
+	if kvWB.Len() > 0 {
+		if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+			return nil, err
+		}
+	}
+	return snapResult, nil
 }
 
 func (ps *PeerStorage) ClearData() {
