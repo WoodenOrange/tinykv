@@ -19,6 +19,8 @@ import (
 	"math/rand"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+
+	"github.com/pingcap-incubator/tinykv/log"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -695,6 +697,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		entries := ptrsToEntries(m.Entries)
 		//追加到日志，处理冲突和截断
 		newEntries, truncated := appendEntriesToLog(r.RaftLog.entries, entries)
+		if truncated && m.Index < r.RaftLog.applied {
+			log.Warnf("%d handleAppendEntries truncates below applied index: prevIdx=%d, applied=%d", r.id, m.Index, r.RaftLog.applied)
+		}
 		r.RaftLog.entries = newEntries
 		if truncated {
 			//发生截断，截断点小于stable，则更新stable
