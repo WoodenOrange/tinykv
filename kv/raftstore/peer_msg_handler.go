@@ -71,9 +71,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 	for _, entry := range rd.CommittedEntries {
 		if len(entry.Data) == 0 {
-			// // 添加日志，打印被跳过的条目信息
-			// log.Infof("%s SKIP empty-data entry: index=%d, term=%d, type=%v",
-			// 	d.Tag, entry.Index, entry.Term, entry.EntryType)
 			continue
 		}
 		d.applyEntry(entry, kvWB, pendingWrites)
@@ -82,7 +79,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	//将pendingWrites中的修改刷入kvWB
 	for cf, m := range pendingWrites {
 		for key, value := range m {
-			//log.Infof("%s WRITING to kv: cf=%s, key=%s, val=%v", d.Tag, cf, key, value)
 			if value == nil {
 				kvWB.DeleteCF(cf, []byte(key))
 			} else {
@@ -101,9 +97,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if err := kvWB.WriteToDB(d.ctx.engine.Kv); err != nil {
 			panic(err)
 		}
-		if len(rd.CommittedEntries) > 0 {
-			log.Infof("%s BATCH APPLIED: count=%d, new applied index=%d", d.Tag, len(rd.CommittedEntries), d.peerStorage.applyState.AppliedIndex)
-		}
 	}
 
 	//通知Raft已处理该Ready
@@ -112,17 +105,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 // +++
 func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry, kvWB *engine_util.WriteBatch, pending map[string]map[string][]byte) {
-	// if entry.Index > 6 {
-	// 	log.Infof("%s APPLY entry: index=%d, term=%d, data_len=%d", d.Tag, entry.Index, entry.Term, len(entry.Data))
-	// }
 	//查找proposal
 	proposal := d.findProposal(entry.Index)
 	stale := false
 	//检查stale command
 	if proposal != nil && proposal.term != entry.Term {
-		//log.Warnf("%s applyEntry index=%d: proposal term mismatch, proposal.term=%d, entry.term=%d, skipping apply", d.Tag, entry.Index, proposal.term, entry.Term)
-		//proposal.cb.Done(ErrResp(&util.ErrStaleCommand{}))
-		//return
 		stale = true
 	}
 
@@ -226,7 +213,6 @@ func (d *peerMsgHandler) applyNormalRequest(reqCmd *raft_cmdpb.Request, resp *ra
 		cf := reqCmd.Put.Cf
 		key := reqCmd.Put.Key
 		value := reqCmd.Put.Value
-		log.Infof("%s APPLY PUT key=%s value=%s", d.Tag, string(key), string(value)) // 新增
 		if pending[cf] == nil {
 			pending[cf] = make(map[string][]byte)
 		}
@@ -262,7 +248,6 @@ func (d *peerMsgHandler) applyNormalRequest(reqCmd *raft_cmdpb.Request, resp *ra
 		})
 
 	default:
-		//log.Warnf("%s unknown cmd type: %v", d.Tag, reqCmd.CmdType)
 		resp.Header.Error = util.RaftstoreErrToPbError(fmt.Errorf("unknown cmd type"))
 	}
 }
@@ -352,25 +337,6 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb:    cb,
 	})
 
-	// 打印 proposal 信息
-	if msg.AdminRequest != nil {
-		log.Infof("%s PROPOSE term=%d index=%d admin %s", d.Tag, term, index, msg.AdminRequest.CmdType.String())
-	} else {
-		for _, req := range msg.Requests {
-			switch req.CmdType {
-			case raft_cmdpb.CmdType_Put:
-				log.Infof("%s PROPOSE term=%d index=%d PUT key=%s", d.Tag, term, index, string(req.Put.Key))
-			case raft_cmdpb.CmdType_Delete:
-				log.Infof("%s PROPOSE term=%d index=%d DELETE key=%s", d.Tag, term, index, string(req.Delete.Key))
-			case raft_cmdpb.CmdType_Get:
-				log.Infof("%s PROPOSE term=%d index=%d GET key=%s", d.Tag, term, index, string(req.Get.Key))
-			case raft_cmdpb.CmdType_Snap:
-				log.Infof("%s PROPOSE term=%d index=%d SNAP", d.Tag, term, index)
-			default:
-				log.Infof("%s PROPOSE term=%d index=%d unknown cmd", d.Tag, term, index)
-			}
-		}
-	}
 	//Raft提议
 	if err := d.RaftGroup.Propose(data); err != nil {
 		//失败则移除刚添加的proposal

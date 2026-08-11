@@ -62,7 +62,6 @@ func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionS
 		return nil, err
 	}
 	if raftState.LastIndex < applyState.AppliedIndex {
-		log.Errorf("Inconsistent state for region %d: raftState.LastIndex=%d, applyState.AppliedIndex=%d, raftState=%+v, applyState=%+v", region.Id, raftState.LastIndex, applyState.AppliedIndex, raftState, applyState)
 		panic(fmt.Sprintf("%s unexpected raft log index: lastIndex %d < appliedIndex %d",
 			tag, raftState.LastIndex, applyState.AppliedIndex))
 	}
@@ -315,11 +314,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	firstIdx := entries[0].Index
 	lastIdx := entries[len(entries)-1].Index
 	lastTerm := entries[len(entries)-1].Term
-
-	//log
-	if len(entries) > 0 && firstIdx <= ps.applyState.AppliedIndex {
-		log.Warnf("%s Append truncates already applied entries: firstIdx=%d, applied=%d, lastIndex=%d", ps.Tag, firstIdx, ps.applyState.AppliedIndex, ps.raftState.LastIndex)
-	}
 
 	// 删除从 firstIdx 到当前 lastIndex 的所有旧日志（将被覆盖）
 	for idx := firstIdx; idx <= ps.raftState.LastIndex; idx++ {
