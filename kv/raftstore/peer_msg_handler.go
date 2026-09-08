@@ -53,6 +53,32 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 	rd := d.RaftGroup.Ready()
 
+	// // === 调试日志开始 ===
+	// if len(rd.CommittedEntries) > 0 {
+	// 	firstIdx := rd.CommittedEntries[0].Index
+	// 	lastIdx := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+	// 	log.Infof("%s READY: committed entries count=%d, range=[%d, %d], msgs=%d",
+	// 		d.Tag, len(rd.CommittedEntries), firstIdx, lastIdx, len(rd.Messages))
+	// } else {
+	// 	log.Infof("%s READY: committed entries=0, msgs=%d", d.Tag, len(rd.Messages))
+	// }
+
+	// // 调试：打印所有待发送的 MsgAppend 消息（仅追加日志）
+	// for _, msg := range rd.Messages {
+	// 	if msg.MsgType == eraftpb.MessageType_MsgAppend {
+	// 		log.Infof("%s READY: send MsgAppend to %d, entries=%d, index=%d, commit=%d",
+	// 			d.Tag, msg.To, len(msg.Entries), msg.Index, msg.Commit)
+	// 	}
+	// 	if msg.MsgType == eraftpb.MessageType_MsgHeartbeatResponse {
+	// 		log.Infof("%s READY: send MsgHeartbeatResponse to %d from %d, index=%d, commit=%d",
+	// 			d.Tag, msg.To, msg.From, msg.Index, msg.Commit)
+	// 	}
+	// 	if msg.MsgType == eraftpb.MessageType_MsgAppendResponse {
+	// 		log.Infof("%s READY: send MsgAppendResponse to %d from %d, index=%d, commit=%d, reject=%v",
+	// 			d.Tag, msg.To, msg.From, msg.Index, msg.Commit, msg.Reject)
+	// 	}
+	// }
+
 	//持久化状态
 	snapResult, err := d.peerStorage.SaveReadyState(&rd)
 	if err != nil {
@@ -71,21 +97,16 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 	for _, entry := range rd.CommittedEntries {
 		if len(entry.Data) == 0 {
+			// // 添加日志，打印被跳过的条目信息
+			// log.Infof("%s SKIP empty-data entry: index=%d, term=%d, type=%v",
+			// 	d.Tag, entry.Index, entry.Term, entry.EntryType)
 			continue
 		}
 		d.applyEntry(entry, kvWB, pendingWrites)
 	}
 
 	//将pendingWrites中的修改刷入kvWB
-	for cf, m := range pendingWrites {
-		for key, value := range m {
-			if value == nil {
-				kvWB.DeleteCF(cf, []byte(key))
-			} else {
-				kvWB.SetCF(cf, []byte(key), value)
-			}
-		}
-	}
+	d.flushPendingWrites(pendingWrites)
 
 	//更新并持久化applied index
 	if len(rd.CommittedEntries) > 0 {
@@ -105,6 +126,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 // +++
 func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry, kvWB *engine_util.WriteBatch, pending map[string]map[string][]byte) {
+	// if entry.Index > 6 {
+	// 	log.Infof("%s APPLY entry: index=%d, term=%d, data_len=%d", d.Tag, entry.Index, entry.Term, len(entry.Data))
+	// }
 	//查找proposal
 	proposal := d.findProposal(entry.Index)
 	stale := false
@@ -122,6 +146,23 @@ func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry, kvWB *engine_util.Write
 		return
 	}
 
+	// // 调试日志（包含命令类型）
+	// if entry.Index > 6 {
+	// 	var cmdInfo string
+	// 	if req.AdminRequest != nil {
+	// 		cmdInfo = "Admin:" + req.AdminRequest.CmdType.String()
+	// 	} else if len(req.Requests) > 0 {
+	// 		//只取第一个命令类型，若多个则追加 "..."
+	// 		cmdInfo = req.Requests[0].CmdType.String()
+	// 		if len(req.Requests) > 1 {
+	// 			cmdInfo += ",..."
+	// 		}
+	// 	} else {
+	// 		cmdInfo = "empty"
+	// 	}
+	// 	log.Infof("%s APPLY entry: index=%d, term=%d, cmds=%s", d.Tag, entry.Index, entry.Term, cmdInfo)
+	// }
+
 	//构建响应
 	resp := &raft_cmdpb.RaftCmdResponse{
 		Header: &raft_cmdpb.RaftResponseHeader{
@@ -129,6 +170,18 @@ func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry, kvWB *engine_util.Write
 		},
 		Responses: []*raft_cmdpb.Response{},
 	}
+
+	// // 调试日志：仅对 index > 9 的条目打印
+	// if entry.Index > 9 {
+	// 	if req.AdminRequest != nil {
+	// 		//log.Infof("%s applyEntry index=%d: AdminRequest is not nil, CmdType=%v", d.Tag, entry.Index, req.AdminRequest.CmdType)
+	// 	} else {
+	// 		//log.Infof("%s applyEntry index=%d: AdminRequest is nil, number of Requests=%d", d.Tag, entry.Index, len(req.Requests))
+	// 		if len(req.Requests) > 0 {
+	// 			log.Infof("%s applyEntry index=%d: first request CmdType=%v", d.Tag, entry.Index, req.Requests[0].CmdType)
+	// 		}
+	// 	}
+	// }
 
 	//处理Admin请求
 	if req.AdminRequest != nil {
@@ -147,6 +200,42 @@ func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry, kvWB *engine_util.Write
 
 	//统一回调，仅一次
 	if proposal != nil {
+		// // ========== 详细调试日志==========
+		// // 构建请求描述字符串
+		// var reqDesc string
+		// if req.AdminRequest != nil {
+		// 	reqDesc = fmt.Sprintf("Admin cmd=%s", req.AdminRequest.CmdType.String())
+		// } else if len(req.Requests) > 0 {
+		// 	var parts []string
+		// 	for _, r := range req.Requests {
+		// 		switch r.CmdType {
+		// 		case raft_cmdpb.CmdType_Put:
+		// 			parts = append(parts, fmt.Sprintf("Put(key=%s, val_len=%d)", string(r.Put.Key), len(r.Put.Value)))
+		// 		case raft_cmdpb.CmdType_Delete:
+		// 			parts = append(parts, fmt.Sprintf("Delete(key=%s)", string(r.Delete.Key)))
+		// 		case raft_cmdpb.CmdType_Get:
+		// 			parts = append(parts, fmt.Sprintf("Get(key=%s)", string(r.Get.Key)))
+		// 		case raft_cmdpb.CmdType_Snap:
+		// 			parts = append(parts, "Snap")
+		// 		default:
+		// 			parts = append(parts, r.CmdType.String())
+		// 		}
+		// 	}
+		// 	reqDesc = strings.Join(parts, ", ")
+		// } else {
+		// 	reqDesc = "empty (noop)"
+		// }
+
+		// // 打印完整的回调信息
+		// log.Infof("%s APPLY callback: index=%d, term=%d, proposal_term=%d, stale=%v, req=[%s]",
+		// 	d.Tag, entry.Index, entry.Term, proposal.term, stale, reqDesc)
+
+		// // 打印响应状态（如果有错误）
+		// if resp.Header.Error != nil {
+		// 	log.Warnf("%s APPLY response error: %s", d.Tag, resp.Header.Error)
+		// }
+
+		// // ========================================================
 		proposal.cb.Done(resp)
 	}
 }
@@ -235,6 +324,14 @@ func (d *peerMsgHandler) applyNormalRequest(reqCmd *raft_cmdpb.Request, resp *ra
 		})
 
 	case raft_cmdpb.CmdType_Snap:
+		//若当前批次有未持久化的修改，立即刷盘
+		if len(pending) > 0 {
+			d.flushPendingWrites(pending)
+			//清空已刷入的 pending
+			for cf := range pending {
+				delete(pending, cf)
+			}
+		}
 		//只读事务，用于后续Scan
 		txn := d.ctx.engine.Kv.NewTransaction(false)
 		if proposal != nil {
@@ -249,6 +346,27 @@ func (d *peerMsgHandler) applyNormalRequest(reqCmd *raft_cmdpb.Request, resp *ra
 
 	default:
 		resp.Header.Error = util.RaftstoreErrToPbError(fmt.Errorf("unknown cmd type"))
+	}
+}
+
+// +++
+// 将pending中的修改刷入kv
+func (d *peerMsgHandler) flushPendingWrites(pending map[string]map[string][]byte) {
+	if len(pending) == 0 {
+		return
+	}
+	kvWB := new(engine_util.WriteBatch)
+	for cf, m := range pending {
+		for key, value := range m {
+			if value == nil {
+				kvWB.DeleteCF(cf, []byte(key))
+			} else {
+				kvWB.SetCF(cf, []byte(key), value)
+			}
+		}
+	}
+	if err := kvWB.WriteToDB(d.ctx.engine.Kv); err != nil {
+		panic(err)
 	}
 }
 
@@ -330,6 +448,27 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	//获取当前term和下一个日志索引
 	term := d.Term()
 	index := d.nextProposalIndex()
+
+	// // 调试日志：打印提议的命令详情
+	// if msg.AdminRequest != nil {
+	// 	log.Infof("%s PROPOSE: Admin cmd=%s, term=%d, index=%d", d.Tag, msg.AdminRequest.CmdType.String(), term, index)
+	// } else {
+	// 	for _, req := range msg.Requests {
+	// 		switch req.CmdType {
+	// 		case raft_cmdpb.CmdType_Put:
+	// 			log.Infof("%s PROPOSE: Put key=%s, value=%s, term=%d, index=%d", d.Tag, string(req.Put.Key), string(req.Put.Value), term, index)
+	// 		case raft_cmdpb.CmdType_Delete:
+	// 			log.Infof("%s PROPOSE: Delete key=%s, term=%d, index=%d", d.Tag, string(req.Delete.Key), term, index)
+	// 		case raft_cmdpb.CmdType_Get:
+	// 			log.Infof("%s PROPOSE: Get key=%s, term=%d, index=%d", d.Tag, string(req.Get.Key), term, index)
+	// 		case raft_cmdpb.CmdType_Snap:
+	// 			log.Infof("%s PROPOSE: Snap, term=%d, index=%d", d.Tag, term, index)
+	// 		default:
+	// 			log.Infof("%s PROPOSE: unknown cmd type %v, term=%d, index=%d", d.Tag, req.CmdType, term, index)
+	// 		}
+	// 	}
+	// }
+
 	//记录回调
 	d.proposals = append(d.proposals, &proposal{
 		index: index,

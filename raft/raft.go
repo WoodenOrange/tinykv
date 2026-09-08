@@ -727,6 +727,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
 	r.becomeFollower(m.Term, m.From)
+	lastIdx := r.RaftLog.LastIndex()
+	lastTerm, _ := r.RaftLog.Term(lastIdx) //日志任期
+
 	//回复
 	resp := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
@@ -734,7 +737,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		From:    r.id,
 		Term:    r.Term,
 		Reject:  false,
-		Index:   r.RaftLog.LastIndex(),
+		Index:   lastIdx,
+		LogTerm: lastTerm,
 	}
 	r.msgs = append(r.msgs, resp)
 }
@@ -749,15 +753,29 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	if !ok {
 		return
 	}
-	//更新follower的匹配索引
-	if m.Index > pr.Match {
-		pr.Match = m.Index
-		pr.Next = pr.Match + 1
+
+	needAppend := false
+	//检查日志是否正确：比较日志对应索引的任期
+	localTerm, err := r.RaftLog.Term(m.Index)
+	if err != nil || localTerm != m.LogTerm {
+		//日志错误
+		needAppend = true
+	} else {
+		//日志正确，更新进度
+		if m.Index > pr.Match {
+			pr.Match = m.Index
+			pr.Next = pr.Match + 1
+		}
+		//若还有待同步日志，继续发送
+		if pr.Next <= r.RaftLog.LastIndex() {
+			needAppend = true
+		}
 	}
-	//如果follower日志落后，立即发送追加
-	if pr.Next <= r.RaftLog.LastIndex() {
+
+	if needAppend {
 		r.sendAppend(m.From)
 	}
+
 	//尝试推进commit索引
 	r.maybeUpdateCommit()
 }
