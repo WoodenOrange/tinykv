@@ -14,6 +14,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/raft"
 	"github.com/pingcap/errors"
@@ -63,6 +64,14 @@ type proposal struct {
 	cb    *message.Callback
 }
 
+// +++
+// 记录只读请求
+type readRequest struct {
+	request  *raft_cmdpb.RaftCmdRequest
+	callback *message.Callback
+	term     uint64 //发起时的任期，用于检查任期是否变更
+}
+
 type peer struct {
 	// The ticker of the peer, used to trigger
 	// * raft tick
@@ -83,7 +92,9 @@ type peer struct {
 
 	// Record the callback of the proposals
 	// (Used in 2B)
-	proposals []*proposal
+	proposals            []*proposal
+	pendingReads         map[uint64]*readRequest //待处理的只读请求，key为只读请求ID
+	nextReadContextIndex uint64                  //用于分配只读请求ID
 
 	// Index of last scheduled compacted raft log.
 	// (Used in 2C)
@@ -142,6 +153,7 @@ func NewPeer(storeId uint64, cfg *config.Config, engines *engine_util.Engines, r
 		regionId:              region.GetId(),
 		RaftGroup:             raftGroup,
 		peerStorage:           ps,
+		pendingReads:          make(map[uint64]*readRequest),
 		peerCache:             make(map[uint64]*metapb.Peer),
 		PeersStartPendingTime: make(map[uint64]time.Time),
 		Tag:                   tag,
@@ -184,7 +196,7 @@ func (p *peer) nextProposalIndex() uint64 {
 	return p.RaftGroup.Raft.RaftLog.LastIndex() + 1
 }
 
-/// Tries to destroy itself. Returns a job (if needed) to do more cleaning tasks.
+// / Tries to destroy itself. Returns a job (if needed) to do more cleaning tasks.
 func (p *peer) MaybeDestroy() bool {
 	if p.stopped {
 		log.Infof("%v is being destroyed, skip", p.Tag)
@@ -193,10 +205,10 @@ func (p *peer) MaybeDestroy() bool {
 	return true
 }
 
-/// Does the real destroy worker.Task which includes:
-/// 1. Set the region to tombstone;
-/// 2. Clear data;
-/// 3. Notify all pending requests.
+// / Does the real destroy worker.Task which includes:
+// / 1. Set the region to tombstone;
+// / 2. Clear data;
+// / 3. Notify all pending requests.
 func (p *peer) Destroy(engine *engine_util.Engines, keepData bool) error {
 	start := time.Now()
 	region := p.Region()
@@ -228,6 +240,11 @@ func (p *peer) Destroy(engine *engine_util.Engines, keepData bool) error {
 	}
 	p.proposals = nil
 
+	for _, read := range p.pendingReads {
+		NotifyReqRegionRemoved(region.Id, read.callback)
+	}
+	p.pendingReads = nil
+
 	log.Infof("%v destroy itself, takes %v", p.Tag, time.Now().Sub(start))
 	return nil
 }
@@ -244,10 +261,10 @@ func (p *peer) Region() *metapb.Region {
 	return p.peerStorage.Region()
 }
 
-/// Set the region of a peer.
-///
-/// This will update the region of the peer, caller must ensure the region
-/// has been preserved in a durable device.
+// / Set the region of a peer.
+// /
+// / This will update the region of the peer, caller must ensure the region
+// / has been preserved in a durable device.
 func (p *peer) SetRegion(region *metapb.Region) {
 	p.peerStorage.SetRegion(region)
 }
@@ -273,7 +290,7 @@ func (p *peer) Send(trans Transport, msgs []eraftpb.Message) {
 	}
 }
 
-/// Collects all pending peers and update `peers_start_pending_time`.
+// / Collects all pending peers and update `peers_start_pending_time`.
 func (p *peer) CollectPendingPeers() []*metapb.Peer {
 	pendingPeers := make([]*metapb.Peer, 0, len(p.Region().GetPeers()))
 	truncatedIdx := p.peerStorage.truncatedIndex()
@@ -301,8 +318,8 @@ func (p *peer) clearPeersStartPendingTime() {
 	}
 }
 
-/// Returns `true` if any new peer catches up with the leader in replicating logs.
-/// And updates `PeersStartPendingTime` if needed.
+// / Returns `true` if any new peer catches up with the leader in replicating logs.
+// / And updates `PeersStartPendingTime` if needed.
 func (p *peer) AnyNewPeerCatchUp(peerId uint64) bool {
 	if len(p.PeersStartPendingTime) == 0 {
 		return false

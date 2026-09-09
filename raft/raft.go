@@ -279,13 +279,19 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	r.sendHeartbeatWithCommit(to, r.RaftLog.committed)
+}
+
+// +++
+// 可指定Commit值的心跳发送（用于只读请求携带请求编号，共用心跳消息，不必增加消息类型）
+func (r *Raft) sendHeartbeatWithCommit(to uint64, commit uint64) {
 	//填充加入即可
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		From:    r.id,
 		To:      to,
 		Term:    r.Term,
-		Commit:  r.RaftLog.committed,
+		Commit:  commit, //允许传入commit（用于只读请求）
 	}
 	r.msgs = append(r.msgs, m)
 }
@@ -739,6 +745,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		Reject:  false,
 		Index:   lastIdx,
 		LogTerm: lastTerm,
+		Commit:  m.Commit, //将心跳携带的commit原样返回（只读请求确认用）
 	}
 	r.msgs = append(r.msgs, resp)
 }

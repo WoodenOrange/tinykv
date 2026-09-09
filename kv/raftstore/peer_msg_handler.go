@@ -16,6 +16,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
+	"github.com/pingcap-incubator/tinykv/raft"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/btree"
 	"github.com/pingcap/errors"
 
@@ -52,6 +53,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	rd := d.RaftGroup.Ready()
+
+	//失去 Leader 身份，所有等待的读请求失效
+	if !d.IsLeader() {
+		d.notifyPendingReadsStale()
+	}
 
 	// // === 调试日志开始 ===
 	// if len(rd.CommittedEntries) > 0 {
@@ -119,6 +125,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			panic(err)
 		}
 	}
+
+	//处理只读请求
+	d.applyReadStates(rd.ReadStates)
 
 	//通知Raft已处理该Ready
 	d.RaftGroup.Advance(rd)
@@ -439,6 +448,12 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	//拦截只读请求，不加入日志
+	if isReadOnlyRequest(msg) {
+		d.proposeReadCommand(msg, cb)
+		return
+	}
+
 	//序列化请求
 	data, err := msg.Marshal()
 	if err != nil {
@@ -481,6 +496,74 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		//失败则移除刚添加的proposal
 		d.proposals = d.proposals[:len(d.proposals)-1]
 		cb.Done(ErrResp(err))
+	}
+}
+
+// +++
+// 判断请求是否为只读（Get/Snap）
+func isReadOnlyRequest(request *raft_cmdpb.RaftCmdRequest) bool {
+	if request.AdminRequest != nil || len(request.Requests) == 0 {
+		return false
+	}
+	for _, command := range request.Requests {
+		if command.CmdType != raft_cmdpb.CmdType_Get && command.CmdType != raft_cmdpb.CmdType_Snap {
+			return false
+		}
+	}
+	return true
+}
+
+// +++
+// 发起只读请求，不经过日志
+func (d *peerMsgHandler) proposeReadCommand(request *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	d.nextReadContextIndex++
+	readIndex := d.nextReadContextIndex
+	//存储请求和回调，记录当前任期
+	d.pendingReads[readIndex] = &readRequest{request: request, callback: cb, term: d.Term()}
+	//调用Raft层的RequestReadIndex，待raft共识确认
+	if err := d.RaftGroup.RequestReadIndex(readIndex); err != nil {
+		delete(d.pendingReads, readIndex)
+		cb.Done(ErrResp(err))
+	}
+}
+
+// +++
+// 应用已确认的ReadState
+func (d *peerMsgHandler) applyReadStates(readStates []raft.ReadState) {
+	for _, readState := range readStates {
+		read, ok := d.pendingReads[readState.RequestCtx]
+		if !ok {
+			continue
+		}
+		delete(d.pendingReads, readState.RequestCtx)
+
+		//检查：仍是 Leader，任期未变，已应用至该索引
+		if !d.IsLeader() || d.Term() != read.term || d.peerStorage.applyState.AppliedIndex < readState.Index {
+			read.callback.Done(ErrRespStaleCommand(d.Term()))
+			continue
+		}
+
+		//构造响应，直接执行读操作
+		response := &raft_cmdpb.RaftCmdResponse{
+			Header:    &raft_cmdpb.RaftResponseHeader{CurrentTerm: d.Term()},
+			Responses: make([]*raft_cmdpb.Response, 0, len(read.request.Requests)),
+		}
+		for _, command := range read.request.Requests {
+			d.applyNormalRequest(command, response, nil, &proposal{cb: read.callback})
+			if response.Header.Error != nil {
+				break
+			}
+		}
+		read.callback.Done(response)
+	}
+}
+
+// +++
+// 使所有pending read失效，非leader时调用
+func (d *peerMsgHandler) notifyPendingReadsStale() {
+	for context, read := range d.pendingReads {
+		delete(d.pendingReads, context)
+		read.callback.Done(ErrRespStaleCommand(d.Term()))
 	}
 }
 

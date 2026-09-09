@@ -79,6 +79,52 @@ func TestRawNodeProposeAndConfChange3A(t *testing.T) {
 	}
 }
 
+// +++
+func TestRawNodeRequestReadIndex2B(t *testing.T) {
+	storage := NewMemoryStorage()
+	raftNode := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, storage)
+	raftNode.becomeCandidate()
+	raftNode.becomeLeader()
+	raftNode.RaftLog.committed = raftNode.RaftLog.LastIndex()
+	raftNode.msgs = nil
+	rawNode := &RawNode{
+		Raft:          raftNode,
+		readIndexAcks: make(map[uint64]map[uint64]struct{}),
+	}
+
+	if err := rawNode.RequestReadIndex(1); err != nil {
+		t.Fatalf("RequestReadIndex returned error: %v", err)
+	}
+	ready := rawNode.Ready()
+	if len(ready.Messages) != 2 {
+		t.Fatalf("heartbeat count = %d, want 2", len(ready.Messages))
+	}
+	for _, message := range ready.Messages {
+		if message.MsgType != pb.MessageType_MsgHeartbeat || message.Commit != readIndexContextBit|1 {
+			t.Fatalf("unexpected read-index heartbeat: %+v", message)
+		}
+	}
+
+	if err := rawNode.Step(pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+		From:    2,
+		Term:    raftNode.Term,
+		Index:   raftNode.RaftLog.LastIndex(),
+		LogTerm: raftNode.Term,
+		Commit:  readIndexContextBit | 1,
+	}); err != nil {
+		t.Fatalf("Step returned error: %v", err)
+	}
+	ready = rawNode.Ready()
+	if len(ready.ReadStates) != 1 {
+		t.Fatalf("read states count = %d, want 1", len(ready.ReadStates))
+	}
+	readState := ready.ReadStates[0]
+	if readState.RequestCtx != 1 || readState.Index != raftNode.RaftLog.committed {
+		t.Fatalf("unexpected read state: %+v", readState)
+	}
+}
+
 // TestRawNodeProposeAddDuplicateNode ensures that two proposes to add the same node should
 // not affect the later propose to add new node.
 func TestRawNodeProposeAddDuplicateNode3A(t *testing.T) {
