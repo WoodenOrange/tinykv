@@ -358,8 +358,15 @@ func (rn *RawNode) Advance(rd Ready) {
 	//快照处理（2C）
 	if !IsEmptySnap(&rd.Snapshot) {
 		rn.Raft.RaftLog.pendingSnapshot = nil
-		//2c
+		rn.Raft.RaftLog.stabled = rd.Snapshot.Metadata.Index
+		if rd.Snapshot.Metadata.Index > rn.Raft.RaftLog.applied {
+			rn.Raft.RaftLog.applied = rd.Snapshot.Metadata.Index
+		}
 	}
+
+	//尝试压缩内存中已被storage compact的日志
+	rn.Raft.RaftLog.maybeCompact()
+
 }
 
 // GetProgress return the Progress of this node and its peers, if this

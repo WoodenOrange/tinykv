@@ -92,6 +92,13 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 	if snapResult != nil {
 		d.SetRegion(snapResult.Region)
+		meta := d.ctx.storeMeta
+		meta.Lock()
+		//删除旧region的range记录，插入新region
+		meta.regionRanges.Delete(&regionItem{region: snapResult.PrevRegion})
+		meta.regionRanges.ReplaceOrInsert(&regionItem{region: snapResult.Region})
+		meta.regions[snapResult.Region.Id] = snapResult.Region
+		meta.Unlock()
 	}
 
 	//发送 Raft 消息
@@ -208,7 +215,7 @@ func (d *peerMsgHandler) applyEntry(entry eraftpb.Entry, kvWB *engine_util.Write
 	}
 
 	//统一回调，仅一次
-	if proposal != nil {
+	if proposal != nil && proposal.cb != nil {
 		// // ========== 详细调试日志==========
 		// // 构建请求描述字符串
 		// var reqDesc string
@@ -272,6 +279,10 @@ func (d *peerMsgHandler) applyAdminRequest(adminReq *raft_cmdpb.AdminRequest, re
 			d.peerStorage.applyState.TruncatedState.Index = compactIdx
 			d.peerStorage.applyState.TruncatedState.Term = adminReq.CompactLog.CompactTerm
 			d.ScheduleCompactLog(compactIdx)
+		}
+		resp.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
+			CompactLog: &raft_cmdpb.CompactLogResponse{},
 		}
 		//其他Admin类型后续处理
 	}
@@ -444,7 +455,9 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
-		cb.Done(ErrResp(err))
+		if cb != nil {
+			cb.Done(ErrResp(err))
+		}
 		return
 	}
 	// Your Code Here (2B).
@@ -495,7 +508,9 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	if err := d.RaftGroup.Propose(data); err != nil {
 		//失败则移除刚添加的proposal
 		d.proposals = d.proposals[:len(d.proposals)-1]
-		cb.Done(ErrResp(err))
+		if cb != nil {
+			cb.Done(ErrResp(err))
+		}
 	}
 }
 

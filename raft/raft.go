@@ -328,10 +328,10 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
 	if term > r.Term {
 		r.Term = term
+		r.Vote = None
 	}
 	r.State = StateFollower
 	r.Lead = lead
-	r.Vote = None
 	r.votes = make(map[uint64]bool)
 	//随机选举超时[electionTimeout, 2*electionTimeout-1] ticks
 	r.electionElapsed = -(1 + rand.Intn(r.electionTimeout-1))
@@ -824,6 +824,62 @@ func (r *Raft) handlePropose(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	r.becomeFollower(m.Term, m.From)
+
+	meta := m.Snapshot.Metadata
+	if meta == nil {
+		return
+	}
+
+	//快照比当前已提交的还旧，直接回复当前committed
+	if meta.Index <= r.RaftLog.committed {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Index:   r.RaftLog.committed,
+		})
+		return
+	}
+
+	//如果本地已经有该index/term的日志，说明快照不必要
+	if t, err := r.RaftLog.Term(meta.Index); err == nil && t == meta.Term {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Index:   r.RaftLog.committed,
+		})
+		return
+	}
+
+	//记录待应用快照，清空内存日志，更新committed
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	r.RaftLog.entries = []pb.Entry{}
+	r.RaftLog.committed = meta.Index
+
+	//根据快照中的ConfState重建Prs
+	r.Prs = make(map[uint64]*Progress)
+	for _, node := range meta.ConfState.Nodes {
+		match, next := uint64(0), meta.Index+1
+		if node == r.id {
+			match = meta.Index
+		}
+		r.Prs[node] = &Progress{Match: match, Next: next}
+	}
+	if _, ok := r.Prs[r.id]; !ok {
+		r.Prs[r.id] = &Progress{Match: meta.Index, Next: meta.Index + 1}
+	}
+
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Index:   meta.Index,
+	})
 }
 
 // addNode add a new node to raft group

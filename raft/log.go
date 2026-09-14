@@ -92,6 +92,24 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	first, err := l.storage.FirstIndex()
+	if err != nil {
+		return
+	}
+	if len(l.entries) == 0 {
+		return
+	}
+	offset := l.entries[0].Index
+	if first <= offset {
+		return
+	}
+	//storage中first之前的日志已经被compact，内存中的丢弃
+	idx := first - offset
+	if idx >= uint64(len(l.entries)) {
+		l.entries = []pb.Entry{}
+		return
+	}
+	l.entries = l.entries[idx:]
 }
 
 // allEntries return all the entries not compacted.
