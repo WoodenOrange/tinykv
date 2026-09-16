@@ -227,10 +227,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 	lastIdx := r.RaftLog.LastIndex()
 	prevIdx := pr.Next - 1
 
-	//获取prevIdx的任期
+	//获取prevIdx的任期，没有就尝试快照
 	prevTerm, err := r.RaftLog.Term(prevIdx)
 	if err != nil {
-		return false
+		return r.sendSnapshot(to, pr)
 	}
 
 	//构建Append消息
@@ -254,14 +254,15 @@ func (r *Raft) sendAppend(to uint64) bool {
 	//获取从pr.Next到lastIdx的条目
 	entries := r.RaftLog.entries
 	if len(entries) == 0 {
-		return false
+		// 内存里没有可用条目，且 pr.Next <= lastIdx，说明只能靠快照
+		return r.sendSnapshot(to, pr)
 	}
 	offset := entries[0].Index
 	lo := pr.Next
 	hi := lastIdx + 1
 	if lo < offset {
 		//需要的更早，需要快照
-		return false
+		return r.sendSnapshot(to, pr)
 	}
 	startIdx := lo - offset
 	endIdx := hi - offset
@@ -880,6 +881,25 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		Term:    r.Term,
 		Index:   meta.Index,
 	})
+}
+
+// +++
+// sendSnapshot向to发送MsgSnapshot，把pr.Next推进到快照之后
+func (r *Raft) sendSnapshot(to uint64, pr *Progress) bool {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		//快照还在生成中，下次心跳响应会再次尝试
+		return false
+	}
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	})
+	pr.Next = snapshot.Metadata.Index + 1
+	return true
 }
 
 // addNode add a new node to raft group
