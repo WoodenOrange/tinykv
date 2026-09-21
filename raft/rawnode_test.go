@@ -89,7 +89,7 @@ func TestRawNodeRequestReadIndex2B(t *testing.T) {
 	raftNode.msgs = nil
 	rawNode := &RawNode{
 		Raft:          raftNode,
-		readIndexAcks: make(map[uint64]map[uint64]struct{}),
+		readIndexAcks: make(map[uint64]*readIndexState),
 	}
 
 	if err := rawNode.RequestReadIndex(1); err != nil {

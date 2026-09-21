@@ -76,6 +76,12 @@ type ReadState struct {
 	RequestCtx uint64 //存readIndex，只读请求分配的序号
 }
 
+// +++
+type readIndexState struct {
+	readIndex uint64              //发起请求时的 committed
+	acks      map[uint64]struct{} //已确认的节点
+}
+
 // RawNode is a wrapper of Raft.
 type RawNode struct {
 	Raft *Raft
@@ -85,8 +91,8 @@ type RawNode struct {
 	prevLead      uint64
 	prevState     StateType
 	//只读请求的信息
-	readIndexAcks map[uint64]map[uint64]struct{} //readIndex->已确认节点->struct{}，用于统计多数派确认
-	readStates    []ReadState                    //待上传的已确认读状态
+	readIndexAcks map[uint64]*readIndexState //readIndex->已确认节点->struct{}，用于统计多数派确认
+	readStates    []ReadState                //待上传的已确认读状态
 }
 
 const readIndexContextBit uint64 = 1 << 63 //最高位标记ReadIndex心跳
@@ -107,35 +113,44 @@ func NewRawNode(config *Config) (*RawNode, error) {
 		prevHardState: hs,
 		prevLead:      None,
 		prevState:     StateFollower,
-		readIndexAcks: make(map[uint64]map[uint64]struct{}),
+		readIndexAcks: make(map[uint64]*readIndexState),
 	}, nil
 }
 
 // +++
 // RequestReadIndex发起只读索引确认
-func (rn *RawNode) RequestReadIndex(readIndex uint64) error {
-	//必须为 Leader，且readIndex有效
-	if readIndex == 0 || readIndex&readIndexContextBit != 0 || rn.Raft.State != StateLeader {
+func (rn *RawNode) RequestReadIndex(ctx uint64) error {
+	//必须为 Leader，且ctx有效
+	if ctx == 0 || ctx&readIndexContextBit != 0 || rn.Raft.State != StateLeader {
 		return ErrProposalDropped
 	}
+
 	//当前commit索引的term要等于当前term，避免旧日志
 	term, err := rn.Raft.RaftLog.Term(rn.Raft.RaftLog.committed)
 	if err != nil || term != rn.Raft.Term {
 		return ErrProposalDropped
 	}
 
+	//记录发起时的commit index
+	readIndex := rn.Raft.RaftLog.committed
+
 	//初始化确认集合，自己确认
 	acks := map[uint64]struct{}{rn.Raft.id: {}}
-	rn.readIndexAcks[readIndex] = acks
+	rn.readIndexAcks[ctx] = &readIndexState{
+		readIndex: readIndex,
+		acks:      acks,
+	}
+
 	//若自己已满足多数派，立即完成
 	if len(acks)*2 > len(rn.Raft.Prs) {
-		rn.completeReadIndex(readIndex)
+		rn.completeReadIndex(ctx)
 		return nil
 	}
+
 	//向所有其他节点发送带readIndex的心跳
 	for id := range rn.Raft.Prs {
 		if id != rn.Raft.id {
-			rn.Raft.sendHeartbeatWithCommit(id, readIndexContextBit|readIndex)
+			rn.Raft.sendHeartbeatWithCommit(id, readIndexContextBit|ctx)
 		}
 	}
 	return nil
@@ -143,9 +158,17 @@ func (rn *RawNode) RequestReadIndex(readIndex uint64) error {
 
 // +++
 // 完成读确认：生成ReadState并加入待上抛队列
-func (rn *RawNode) completeReadIndex(readIndex uint64) {
-	delete(rn.readIndexAcks, readIndex)
-	rn.readStates = append(rn.readStates, ReadState{Index: rn.Raft.RaftLog.committed, RequestCtx: readIndex})
+func (rn *RawNode) completeReadIndex(ctx uint64) {
+	state, ok := rn.readIndexAcks[ctx]
+	if !ok {
+		return
+	}
+	delete(rn.readIndexAcks, ctx)
+
+	rn.readStates = append(rn.readStates, ReadState{
+		Index:      state.readIndex, //使用发起时的commit
+		RequestCtx: ctx,             //请求 ID
+	})
 }
 
 // +++
@@ -155,15 +178,17 @@ func (rn *RawNode) handleReadIndexResponse(m pb.Message) {
 	if m.MsgType != pb.MessageType_MsgHeartbeatResponse || m.Commit&readIndexContextBit == 0 || rn.Raft.State != StateLeader {
 		return
 	}
+
 	//处理并统计对应readIndex的回复
-	readIndex := m.Commit &^ readIndexContextBit
-	acks, ok := rn.readIndexAcks[readIndex]
+	ctx := m.Commit &^ readIndexContextBit
+	state, ok := rn.readIndexAcks[ctx]
 	if !ok {
 		return
 	}
-	acks[m.From] = struct{}{}           //记录该节点已确认
-	if len(acks)*2 > len(rn.Raft.Prs) { //多数派已确认
-		rn.completeReadIndex(readIndex)
+
+	state.acks[m.From] = struct{}{}           //记录该节点已确认
+	if len(state.acks)*2 > len(rn.Raft.Prs) { //多数派已确认
+		rn.completeReadIndex(ctx)
 	}
 }
 
