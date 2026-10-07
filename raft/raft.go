@@ -204,10 +204,7 @@ func newRaft(c *Config) *Raft {
 			r.Prs[node] = &Progress{Next: raftLog.LastIndex() + 1, Match: 0}
 		}
 	}
-	//确保自身节点存在于进度映射，不存在则补充创建
-	if _, ok := r.Prs[r.id]; !ok {
-		r.Prs[r.id] = &Progress{Next: raftLog.LastIndex() + 1, Match: 0}
-	}
+	//不直接把自己加入节点，自身有可能不在其中
 	//从EntryConfChange中恢复，如果有
 	r.resetPendingConfIndex()
 
