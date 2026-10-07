@@ -431,6 +431,8 @@ func (d *peerMsgHandler) applyChangePeer(change *raft_cmdpb.ChangePeerRequest, c
 		region.RegionEpoch.ConfVer++
 		meta.WriteRegionState(wb, region, rspb.PeerState_Normal)
 		wb.MustWriteToDB(d.ctx.engine.Kv)
+		//提前提交后清空批次，避免Ready末尾重复写入已被Badger改写的Entry。
+		wb.Reset()
 		sm := d.ctx.storeMeta
 		sm.Lock()
 		sm.regionRanges.Delete(&regionItem{region: d.Region()})
@@ -482,6 +484,8 @@ func (d *peerMsgHandler) applySplit(split *raft_cmdpb.SplitRequest, resp *raft_c
 	meta.WriteRegionState(wb, left, rspb.PeerState_Normal)
 	meta.WriteRegionState(wb, right, rspb.PeerState_Normal)
 	wb.MustWriteToDB(d.ctx.engine.Kv)
+	// 提前提交后清空批次，避免Ready末尾重复写入已被Badger改写的Entry。
+	wb.Reset()
 	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, right)
 	if err != nil {
 		sm.Unlock()
