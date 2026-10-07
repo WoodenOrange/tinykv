@@ -208,6 +208,8 @@ func newRaft(c *Config) *Raft {
 	if _, ok := r.Prs[r.id]; !ok {
 		r.Prs[r.id] = &Progress{Next: raftLog.LastIndex() + 1, Match: 0}
 	}
+	//从EntryConfChange中恢复，如果有
+	r.resetPendingConfIndex()
 
 	//随机化选举计时
 	r.electionElapsed = -(1 + rand.Intn(r.electionTimeout-1))
@@ -314,6 +316,10 @@ func (r *Raft) tick() {
 				}
 			}
 		}
+		//超时取消节点转移
+		if r.leadTransferee != None && r.electionElapsed >= r.electionTimeout {
+			r.abortLeaderTransfer()
+		}
 	} else {
 		//Follower或Candidate，超时选举
 		if r.electionElapsed >= r.electionTimeout {
@@ -334,6 +340,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.State = StateFollower
 	r.Lead = lead
 	r.votes = make(map[uint64]bool)
+	r.leadTransferee = None
 	//随机选举超时[electionTimeout, 2*electionTimeout-1] ticks
 	r.electionElapsed = -(1 + rand.Intn(r.electionTimeout-1))
 }
@@ -347,6 +354,7 @@ func (r *Raft) becomeCandidate() {
 	r.Lead = None
 	r.votes = make(map[uint64]bool)
 	r.votes[r.id] = true
+	r.leadTransferee = None
 	//随机选举超时[electionTimeout, 2*electionTimeout-1] ticks
 	r.electionElapsed = -(1 + rand.Intn(r.electionTimeout-1))
 }
@@ -358,6 +366,8 @@ func (r *Raft) becomeLeader() {
 	r.State = StateLeader
 	r.Lead = r.id
 	r.votes = make(map[uint64]bool)
+	r.leadTransferee = None
+	r.resetPendingConfIndex()
 	//重置节点日志同步进度
 	lastIdx := r.RaftLog.LastIndex()
 	for id := range r.Prs {
@@ -436,6 +446,17 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTransferLeader:
+		//follower收到，转发
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
+	case pb.MessageType_MsgTimeoutNow:
+		//立即发起选举
+		if _, ok := r.Prs[r.id]; ok {
+			r.campaign()
+		}
 	}
 	return nil
 }
@@ -454,6 +475,11 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgTimeoutNow:
+		//立即发起选举
+		if _, ok := r.Prs[r.id]; ok {
+			r.campaign()
+		}
 	}
 	return nil
 }
@@ -485,7 +511,9 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	case pb.MessageType_MsgAppendResponse:
 		r.handleAppendResponse(m)
 	case pb.MessageType_MsgPropose:
-		r.handlePropose(m)
+		return r.handlePropose(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m.From)
 	}
 	return nil
 }
@@ -493,6 +521,10 @@ func (r *Raft) stepLeader(m pb.Message) error {
 // +++
 // 发起一轮选举
 func (r *Raft) campaign() {
+	//避免已移除节点发起选举
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
 	//切换状态
 	r.becomeCandidate()
 	//获取本地最新日志
@@ -627,6 +659,9 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 
 	//尝试更新commit索引
 	r.maybeUpdateCommit()
+	if r.leadTransferee == m.From && pr.Match == r.RaftLog.LastIndex() {
+		r.sendTimeoutNow(m.From)
+	}
 }
 
 // +++
@@ -644,12 +679,9 @@ func (r *Raft) maybeUpdateCommit() {
 		if err != nil || term != r.Term {
 			continue
 		}
-		//统计Match>=idx的节点数
-		count := 1
-		for id, pr := range r.Prs {
-			if id == r.id {
-				continue
-			}
+		//统计Match>=idx的节点数，不默认加入自己
+		count := 0
+		for _, pr := range r.Prs {
 			if pr.Match >= idx {
 				count++
 			}
@@ -786,20 +818,34 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 
 	//尝试推进commit索引
 	r.maybeUpdateCommit()
+	if r.leadTransferee == m.From && pr.Match == r.RaftLog.LastIndex() {
+		r.sendTimeoutNow(m.From)
+	}
 }
 
 // +++
 // 处理客户端提案MsgPropose（仅Leader）
-func (r *Raft) handlePropose(m pb.Message) {
+func (r *Raft) handlePropose(m pb.Message) error {
 	if len(m.Entries) == 0 {
-		return
+		return nil
+	}
+	if r.leadTransferee != None {
+		return ErrProposalDropped
 	}
 	//为每个条目设置的Index和Term
 	lastIdx := r.RaftLog.LastIndex()
 	for i, ent := range m.Entries {
 		ent.Index = lastIdx + uint64(i) + 1
 		ent.Term = r.Term
-		if ent.EntryType != pb.EntryType_EntryConfChange {
+		//如果是EntryConfChange，更新PendingConfIndex
+		if ent.EntryType == pb.EntryType_EntryConfChange {
+			//如果有未应用的EntryConfChange，当前EntryConfChange降级为EntryNormal，不更新
+			if r.PendingConfIndex > r.RaftLog.applied {
+				ent.EntryType = pb.EntryType_EntryNormal
+			} else {
+				r.PendingConfIndex = ent.Index
+			}
+		} else {
 			ent.EntryType = pb.EntryType_EntryNormal
 		}
 	}
@@ -820,6 +866,69 @@ func (r *Raft) handlePropose(m pb.Message) {
 
 	//尝试提交（单节点就会判定成功）
 	r.maybeUpdateCommit()
+	return nil
+}
+
+// +++
+// 处理MsgTransferLeader消息，尝试发起领导权转移（仅Leader）
+func (r *Raft) handleTransferLeader(transferee uint64) {
+	//重复请求，则跳过，否则超时会被重置
+	if r.leadTransferee == transferee {
+		return
+	}
+	//非重复请求，取消已有的转移
+	if r.leadTransferee != None {
+		r.abortLeaderTransfer()
+	}
+	//避免转移给自己
+	if transferee == r.id {
+		return
+	}
+	//目标不在集群中，忽略
+	pr, ok := r.Prs[transferee]
+	if !ok {
+		return
+	}
+
+	//设置状态并重置超时
+	r.leadTransferee = transferee
+	r.electionElapsed = 0
+	//已追平，立即sendTimeoutNow
+	if pr.Match == r.RaftLog.LastIndex() {
+		r.sendTimeoutNow(transferee)
+		return
+	}
+	//未追平，sendAppend
+	r.sendAppend(transferee)
+}
+
+// +++
+// 发送MsgTimeoutNow(仅Leader)
+func (r *Raft) sendTimeoutNow(to uint64) {
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+	})
+}
+
+// +++
+// 退出领导权转移，清空转移目标，并重置选举计时
+func (r *Raft) abortLeaderTransfer() {
+	r.leadTransferee = None
+	r.electionElapsed = 0
+}
+
+// +++
+// 重置PendingConfIndex，遍历日志中所有EntryConfChange，取最大的，保存Index
+func (r *Raft) resetPendingConfIndex() {
+	r.PendingConfIndex = 0
+	for _, ent := range r.RaftLog.entries {
+		if ent.Index > r.RaftLog.applied && ent.EntryType == pb.EntryType_EntryConfChange {
+			r.PendingConfIndex = ent.Index
+		}
+	}
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -905,11 +1014,34 @@ func (r *Raft) sendSnapshot(to uint64, pr *Progress) bool {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	//已经应用了，清空标记
+	r.PendingConfIndex = 0
+	//不重复添加
+	if _, ok := r.Prs[id]; ok {
+		return
+	}
+	//把节点加入 Prs
+	r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	//已经应用了，清空标记
+	r.PendingConfIndex = 0
+	//不重复删除
+	if _, ok := r.Prs[id]; !ok {
+		return
+	}
+	delete(r.Prs, id)
+	//取消领导权转移
+	if r.leadTransferee == id {
+		r.abortLeaderTransfer()
+	}
+	//节点减少，尝试推进commit索引
+	if len(r.Prs) > 0 {
+		r.maybeUpdateCommit()
+	}
 }
 
 // +++
