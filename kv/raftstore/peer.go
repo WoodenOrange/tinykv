@@ -110,7 +110,8 @@ type peer struct {
 	PeersStartPendingTime map[uint64]time.Time
 	// Mark the peer as stopped, set when peer is destroyed
 	// (Used in 3B conf change)
-	stopped bool
+	stopped       bool
+	pendingRemove bool // 当前Ready应用结束后销毁自身
 
 	// An inaccurate difference in region size since last reset.
 	// split checker is triggered when it exceeds the threshold, it makes split checker not scan the data very often

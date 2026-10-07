@@ -279,7 +279,12 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	r.sendHeartbeatWithCommit(to, r.RaftLog.committed)
+	//新副本Match=0，发送初始心跳以触发raftstore创建Peer
+	commit := r.RaftLog.committed
+	if pr := r.Prs[to]; pr != nil && pr.Match < commit {
+		commit = pr.Match
+	}
+	r.sendHeartbeatWithCommit(to, commit)
 }
 
 // +++
