@@ -750,7 +750,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if len(m.Entries) > 0 {
 		lastIdx = m.Entries[len(m.Entries)-1].Index
 	}
-	r.RaftLog.committed = min(m.Commit, lastIdx)
+	//延迟或乱序的Append不能降低已提交位置
+	if commit := min(m.Commit, lastIdx); commit > r.RaftLog.committed {
+		r.RaftLog.committed = commit
+	}
 
 	//回复成功
 	resp := pb.Message{
@@ -770,6 +773,12 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	r.becomeFollower(m.Term, m.From)
 	lastIdx := r.RaftLog.LastIndex()
 	lastTerm, _ := r.RaftLog.Term(lastIdx) //日志任期
+	//发送端已将普通心跳Commit限制在目标Match内，接收端只向前推进
+	if m.Commit&readIndexContextBit == 0 {
+		if commit := min(m.Commit, lastIdx); commit > r.RaftLog.committed {
+			r.RaftLog.committed = commit
+		}
+	}
 
 	//回复
 	resp := pb.Message{
