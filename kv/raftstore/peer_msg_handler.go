@@ -473,33 +473,41 @@ func (d *peerMsgHandler) applySplit(split *raft_cmdpb.SplitRequest, resp *raft_c
 		resp.Header.Error = util.RaftstoreErrToPbError(err)
 		return
 	}
+	//构造左右region
 	left, right := d.buildSplitRegions(split)
 	sm := d.ctx.storeMeta
 	sm.Lock()
+	//新regionid已存在，重复了，报错
 	if _, exists := sm.regions[right.Id]; exists {
 		sm.Unlock()
 		resp.Header.Error = util.RaftstoreErrToPbError(fmt.Errorf("split region already exists"))
 		return
 	}
+	//持久化
 	meta.WriteRegionState(wb, left, rspb.PeerState_Normal)
 	meta.WriteRegionState(wb, right, rspb.PeerState_Normal)
 	wb.MustWriteToDB(d.ctx.engine.Kv)
 	// 提前提交后清空批次，避免Ready末尾重复写入已被Badger改写的Entry。
 	wb.Reset()
+	//创建右侧peer
 	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, right)
 	if err != nil {
 		sm.Unlock()
 		panic(err)
 	}
+	//更新region表
 	sm.regionRanges.Delete(&regionItem{region: d.Region()})
 	d.SetRegion(left)
 	sm.regions[left.Id] = left
 	sm.regions[right.Id] = right
 	sm.regionRanges.ReplaceOrInsert(&regionItem{region: left})
 	sm.regionRanges.ReplaceOrInsert(&regionItem{region: right})
+	//注册新peer的router
 	d.ctx.router.register(newPeer)
+	//取出新Region的暂存投票
 	votes := d.takePendingVotes(right.Id)
 	sm.Unlock()
+	//尝试竞选，启动ticker，发送暂存投票
 	newPeer.MaybeCampaign(d.IsLeader())
 	_ = d.ctx.router.send(right.Id, message.Msg{Type: message.MsgTypeStart})
 	for _, vote := range votes {

@@ -714,6 +714,16 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 	//检查prevLogIndex和prevLogTerm
 	prevIdx := m.Index
+	//已提交前缀不可覆盖。快照尚未持久化时，旧 Append 仍可命中磁盘旧日志
+	//但对应项已不在内存切片中；直接确认committed，避免负下标
+	if prevIdx < r.RaftLog.committed {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From, From: r.id, Term: r.Term,
+			Index: r.RaftLog.committed,
+		})
+		return
+	}
 	//prevIdx == 0日志开头开始，无需检查
 	if prevIdx != 0 {
 		prevTerm, err := r.RaftLog.Term(prevIdx)
@@ -762,7 +772,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		From:    r.id,
 		Term:    r.Term,
 		Reject:  false,
-		Index:   r.RaftLog.LastIndex(), //已确认到的最后索引
+		Index:   lastIdx, //只确认本次Append匹配的前缀，不能确认本地未知后缀
 	}
 	r.msgs = append(r.msgs, resp)
 }

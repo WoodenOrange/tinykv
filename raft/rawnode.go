@@ -364,6 +364,15 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.prevHardState = rd.HardState
 	}
 
+	//先推进快照位置，再推进其后的日志，不能让快照覆盖更高的stabled
+	if !IsEmptySnap(&rd.Snapshot) {
+		rn.Raft.RaftLog.pendingSnapshot = nil
+		rn.Raft.RaftLog.stabled = rd.Snapshot.Metadata.Index
+		if rd.Snapshot.Metadata.Index > rn.Raft.RaftLog.applied {
+			rn.Raft.RaftLog.applied = rd.Snapshot.Metadata.Index
+		}
+	}
+
 	//更新stabled
 	if len(rd.Entries) > 0 {
 		last := rd.Entries[len(rd.Entries)-1].Index
@@ -377,15 +386,6 @@ func (rn *RawNode) Advance(rd Ready) {
 		last := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 		if last > rn.Raft.RaftLog.applied {
 			rn.Raft.RaftLog.applied = last
-		}
-	}
-
-	//快照处理（2C）
-	if !IsEmptySnap(&rd.Snapshot) {
-		rn.Raft.RaftLog.pendingSnapshot = nil
-		rn.Raft.RaftLog.stabled = rd.Snapshot.Metadata.Index
-		if rd.Snapshot.Metadata.Index > rn.Raft.RaftLog.applied {
-			rn.Raft.RaftLog.applied = rd.Snapshot.Metadata.Index
 		}
 	}
 

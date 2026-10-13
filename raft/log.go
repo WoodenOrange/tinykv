@@ -154,20 +154,21 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	// 如果有待应用快照，快照index就是当前最后index
+	//快照之后可以在同一批消息中继续追加日志
+	if len(l.entries) > 0 {
+		return l.entries[len(l.entries)-1].Index
+	}
+	//没有后续日志时，待应用快照才是最后位置
 	if l.pendingSnapshot != nil && !IsEmptySnap(l.pendingSnapshot) {
 		return l.pendingSnapshot.Metadata.Index
 	}
 
-	if len(l.entries) == 0 {
-		//空就返回持久层最大值
-		idx, err := l.storage.LastIndex()
-		if err == nil {
-			return idx
-		}
-		return 0
+	//空就返回持久层最大值
+	idx, err := l.storage.LastIndex()
+	if err == nil {
+		return idx
 	}
-	return l.entries[len(l.entries)-1].Index
+	return 0
 }
 
 // Term return the term of the entry in the given index

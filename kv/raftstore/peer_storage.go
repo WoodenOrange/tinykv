@@ -352,7 +352,10 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	}
 
 	//清理新region范围之外的旧数据
-	ps.clearExtraData(snapRegion)
+	//未初始化的peer不能按全Store清理
+	if ps.isInitialized() {
+		ps.clearExtraData(snapRegion)
+	}
 
 	//更新applyState
 	ps.applyState.AppliedIndex = snapshot.Metadata.Index
@@ -380,8 +383,9 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		RegionId: prevRegion.GetId(),
 		Notifier: ch,
 		SnapMeta: snapshot.Metadata,
-		StartKey: prevRegion.GetStartKey(),
-		EndKey:   prevRegion.GetEndKey(),
+		//清理快照覆盖的范围
+		StartKey: snapRegion.GetStartKey(),
+		EndKey:   snapRegion.GetEndKey(),
 	}
 	<-ch
 	ps.snapState = snap.SnapState{
@@ -402,16 +406,6 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	raftWB := new(engine_util.WriteBatch)
 	kvWB := new(engine_util.WriteBatch)
 
-	//保存HardState
-	if !raft.IsEmptyHardState(ready.HardState) {
-		ps.raftState.HardState = &ready.HardState
-	}
-
-	//追加日志条目
-	if err := ps.Append(ready.Entries, raftWB); err != nil {
-		return nil, err
-	}
-
 	//处理快照（Part C）
 	var snapResult *ApplySnapResult
 	if !raft.IsEmptySnap(&ready.Snapshot) {
@@ -420,6 +414,15 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 			return nil, err
 		}
 		snapResult = res
+	}
+
+	//快照先清除旧日志，再保存同一Ready中快照之后的条目
+	if err := ps.Append(ready.Entries, raftWB); err != nil {
+		return nil, err
+	}
+	//ApplySnapshot会设置快照的Commit；Ready的状态可包含更高的提交位置
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
 	}
 
 	//持久化RaftLocalState
