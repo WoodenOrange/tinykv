@@ -279,7 +279,59 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+	c.Lock()
+	defer c.Unlock()
 
+	origin := c.core.GetRegion(region.GetID())
+	overlaps := c.core.GetOverlaps(region)
+	epoch := region.GetRegionEpoch()
+	//检查epoch，拒绝旧心跳
+	checkStale := func(previous *core.RegionInfo) error {
+		previousEpoch := previous.GetRegionEpoch()
+		if epoch.GetVersion() < previousEpoch.GetVersion() || epoch.GetConfVer() < previousEpoch.GetConfVer() {
+			return errors.Errorf("region %d heartbeat is stale: epoch %v, current region %d epoch %v",
+				region.GetID(), epoch, previous.GetID(), previousEpoch)
+		}
+		return nil
+	}
+	if origin != nil {
+		if err := checkStale(origin); err != nil {
+			return err
+		}
+	}
+	for _, previous := range overlaps {
+		if err := checkStale(previous); err != nil {
+			return err
+		}
+	}
+
+	//检查变化，没有变化时跳过更新
+	if origin != nil && proto.Equal(region.GetMeta(), origin.GetMeta()) && //Region元数据
+		proto.Equal(region.GetLeader(), origin.GetLeader()) && //leader
+		region.GetApproximateSize() == origin.GetApproximateSize() && //ApproximateSize
+		len(region.GetPendingPeers()) == 0 && len(origin.GetPendingPeers()) == 0 { //新旧都没有pending peer
+		return nil
+	}
+
+	//首次收到有效 leader 的心跳，计入调度启动所需的活跃 Region
+	if region.GetLeader().GetId() != 0 && (origin == nil || origin.GetLeader().GetId() == 0) {
+		c.prepareChecker.collect(region)
+	}
+	storeIDs := region.GetStoreIds()
+	if origin != nil {
+		for id := range origin.GetStoreIds() {
+			storeIDs[id] = struct{}{}
+		}
+	}
+	for _, previous := range c.core.PutRegion(region) {
+		for id := range previous.GetStoreIds() {
+			storeIDs[id] = struct{}{}
+		}
+	}
+	// 被移除副本所在 Store 也要刷新，不能只更新新 Region 的 peers。
+	for id := range storeIDs {
+		c.updateStoreStatusLocked(id)
+	}
 	return nil
 }
 
