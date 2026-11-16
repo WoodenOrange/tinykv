@@ -8,6 +8,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/latches"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/mvcc"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	coppb "github.com/pingcap-incubator/tinykv/proto/pkg/coprocessor"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/tinykvpb"
@@ -204,6 +205,8 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 		if lock == nil {
 			// 兼容现有 MissingPrewrite 测试：无锁、无记录时不做修改。
 			continue
+			// resp.Error = &kvrpcpb.KeyError{Abort: "commit without prewrite: lock not found"}
+			// return resp, nil
 		}
 		//被其他锁住，返回错误
 		if lock.Ts != req.StartVersion {
@@ -230,22 +233,206 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {
 	// Your Code Here (4C).
+	resp := new(kvrpcpb.ScanResponse)
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	defer reader.Close()
+	scan := mvcc.NewScanner(req.StartKey, mvcc.NewMvccTxn(reader, req.Version))
+	defer scan.Close()
+	for uint32(len(resp.Pairs)) < req.Limit {
+		key, value, err := scan.Next()
+		pair := &kvrpcpb.KvPair{Key: key, Value: value}
+		if err != nil {
+			if keyErr, ok := err.(*mvcc.KeyError); ok {
+				pair.Error = &keyErr.KeyError
+			} else {
+				return nil, err
+			}
+		} else if key == nil {
+			break
+		}
+		resp.Pairs = append(resp.Pairs, pair)
+	}
+	return resp, nil
+}
+
+// +++
+// rollbackKeys 只累计修改；调用者必须持有全部 key 的 latch 并统一落盘。
+func rollbackKeys(txn *mvcc.MvccTxn, keys [][]byte) (*kvrpcpb.KeyError, error) {
+	for _, key := range keys {
+		write, _, err := txn.CurrentWrite(key)
+		if err != nil {
+			return nil, err
+		}
+		if write != nil {
+			if write.Kind != mvcc.WriteKindRollback {
+				return &kvrpcpb.KeyError{Abort: "transaction already committed"}, nil
+			}
+			continue
+		}
+		lock, err := txn.GetLock(key)
+		if err != nil {
+			return nil, err
+		}
+		if lock != nil && lock.Ts == txn.StartTS {
+			txn.DeleteLock(key)
+		}
+		// 无锁也留下回滚记录，阻止延迟到达的预写复活事务。
+		txn.DeleteValue(key)
+		txn.PutWrite(key, txn.StartTS, &mvcc.Write{StartTS: txn.StartTS, Kind: mvcc.WriteKindRollback})
+	}
 	return nil, nil
 }
 
 func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	resp := new(kvrpcpb.CheckTxnStatusResponse)
+	keys := [][]byte{req.PrimaryKey}
+	server.Latches.WaitForLatches(keys)
+	defer server.Latches.ReleaseLatches(keys)
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	defer reader.Close()
+	txn := mvcc.NewMvccTxn(reader, req.LockTs)
+	write, commitTS, err := txn.CurrentWrite(req.PrimaryKey)
+	if err != nil {
+		return nil, err
+	}
+	if write != nil {
+		if write.Kind != mvcc.WriteKindRollback {
+			resp.CommitVersion = commitTS
+		}
+		return resp, nil
+	}
+	lock, err := txn.GetLock(req.PrimaryKey)
+	if err != nil {
+		return nil, err
+	}
+	if lock != nil && lock.Ts == req.LockTs {
+		now, start := mvcc.PhysicalTime(req.CurrentTs), mvcc.PhysicalTime(lock.Ts)
+		// 用差值比较避免时间戳加 TTL 溢出；相等时尚未过期。
+		if now <= start || now-start <= lock.Ttl {
+			resp.LockTtl = lock.Ttl
+			return resp, nil
+		}
+		resp.Action = kvrpcpb.Action_TTLExpireRollback
+	} else {
+		resp.Action = kvrpcpb.Action_LockNotExistRollback
+	}
+	if lock != nil && lock.Ts == req.LockTs {
+		txn.DeleteLock(req.PrimaryKey)
+	}
+	txn.DeleteValue(req.PrimaryKey)
+	txn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{StartTS: req.LockTs, Kind: mvcc.WriteKindRollback})
+	server.Latches.Validate(txn, keys)
+	if err := server.storage.Write(req.Context, txn.Writes()); err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollbackRequest) (*kvrpcpb.BatchRollbackResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	resp := new(kvrpcpb.BatchRollbackResponse)
+	server.Latches.WaitForLatches(req.Keys)
+	defer server.Latches.ReleaseLatches(req.Keys)
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	defer reader.Close()
+	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
+	resp.Error, err = rollbackKeys(txn, req.Keys)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return resp, nil
+	}
+	server.Latches.Validate(txn, req.Keys)
+	if len(txn.Writes()) != 0 {
+		if err := server.storage.Write(req.Context, txn.Writes()); err != nil {
+			if regionErr, ok := err.(*raft_storage.RegionError); ok {
+				resp.RegionError = regionErr.RequestErr
+				return resp, nil
+			}
+			return nil, err
+		}
+	}
+	return resp, nil
 }
 
-func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
+func (server *Server) KvResolveLock(ctx context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	resp := new(kvrpcpb.ResolveLockResponse)
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		if regionErr, ok := err.(*raft_storage.RegionError); ok {
+			resp.RegionError = regionErr.RequestErr
+			return resp, nil
+		}
+		return nil, err
+	}
+	iter := reader.IterCF(engine_util.CfLock)
+	var keys [][]byte
+	// 显式 Seek，真实 Badger 迭代器创建后不会自动定位到首项。
+	for iter.Seek(nil); iter.Valid(); iter.Next() {
+		value, readErr := iter.Item().ValueCopy(nil)
+		if readErr != nil {
+			err = readErr
+			break
+		}
+		lock, parseErr := mvcc.ParseLock(value)
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
+		if lock.Ts == req.StartVersion {
+			keys = append(keys, iter.Item().KeyCopy(nil))
+		}
+	}
+	iter.Close()
+	reader.Close()
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return resp, nil
+	}
+	if req.CommitVersion == 0 {
+		result, err := server.KvBatchRollback(ctx, &kvrpcpb.BatchRollbackRequest{Context: req.Context, StartVersion: req.StartVersion, Keys: keys})
+		if err != nil {
+			return nil, err
+		}
+		resp.Error, resp.RegionError = result.Error, result.RegionError
+	} else {
+		result, err := server.KvCommit(ctx, &kvrpcpb.CommitRequest{Context: req.Context, StartVersion: req.StartVersion, CommitVersion: req.CommitVersion, Keys: keys})
+		if err != nil {
+			return nil, err
+		}
+		resp.Error, resp.RegionError = result.Error, result.RegionError
+	}
+	return resp, nil
 }
 
 // SQL push down commands.
